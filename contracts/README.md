@@ -49,7 +49,9 @@ create_commitment ──► fund_escrow ──► release            (matured: p
 | `create_commitment(owner, asset, amount, risk, duration_days, penalty_bps)` | Create an unfunded commitment with explicit penalty; returns its `id`. |
 | `create_commitment_with_default_penalty(owner, asset, amount, risk, duration_days)` | Create an unfunded commitment using the default penalty for the risk profile; returns its `id`. |
 | `fund_escrow(commitment_id)` | Transfer `amount` from owner into the contract (`Created → Funded`). |
-| `release(commitment_id, caller)` | Return principal to owner once matured (`Funded → Released`). |
+| `deposit_yield_pool(admin, amount)` | Admin-only deposit of yield tokens into the contract yield pool. |
+| `get_yield_pool_balance()` | Read the yield pool balance available for matured release payouts. |
+| `release(commitment_id, caller)` | Return principal plus accrued yield to owner once matured (`Funded → Released`). |
 | `refund(commitment_id)` | Early-exit refund of principal minus `penalty_bps` (`Funded → Refunded`). |
 | `dispute(commitment_id, caller, reason)` | Freeze a funded commitment pending admin resolution. The reason is automatically categorized. |
 | `resolve_dispute(commitment_id, release_to_owner)` | Admin-only settlement of a disputed commitment. |
@@ -102,6 +104,16 @@ const result = await invokeContractMethod(
 );
 console.log(`Exit Amount: ${result.exitAmount}, Penalty: ${result.penaltyAmount}`);
 ```
+
+### Yield model
+
+Matured `release` payouts now return the locked principal plus the commitment's accrued yield. Yield is calculated at commitment creation using a simple annualized model based on the selected `RiskProfile` and the commitment duration.
+
+- `Safe`: 5.00% annualized
+- `Balanced`: 7.00% annualized
+- `Aggressive`: 10.00% annualized
+
+Yield is funded by the admin through `deposit_yield_pool(admin, amount)`. The contract maintains a dedicated yield pool balance, and a matured release will fail if the pool has insufficient funds to pay the accrued yield.
 
 ### Risk profiles & penalties
 
