@@ -40,6 +40,7 @@ export const CommitmentItemSchema = z.object({
   violationCount: z.number().optional(),
   createdAt: z.string(),
   expiresAt: z.string(),
+  contractVersion: z.string().optional(),
 });
 
 export const CommitmentsListResponseSchema = OkBodySchema(
@@ -105,6 +106,7 @@ export const CommitmentDetailSchema = z.object({
   maxLossPercent: z.number().nullable(),
   tokenId: z.string().optional(),
   nftMetadataLink: z.string().optional(),
+  contractVersion: z.string().optional(),
 });
 
 export const CommitmentDetailResponseSchema = OkBodySchema(CommitmentDetailSchema);
@@ -135,6 +137,7 @@ export const AttestationSummarySchema = z.object({
   violation: z.boolean(),
   feeEarned: z.string().optional(),
   recordedAt: z.string(),
+  contractVersion: z.string().optional(),
 });
 
 export const AttestationPostResponseSchema = OkBodySchema(
