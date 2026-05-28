@@ -158,22 +158,15 @@ Yield is funded by the admin through `deposit_yield_pool(admin, amount)`. The co
 points (`penalty_bps`, max `10_000`) and is paid to the configured fee
 recipient on `refund` / adverse `resolve_dispute`.
 
-### Refund math model and invariants
+### Commitment limits
 
-Refunds are computed with integer basis-point math:
+To prevent arithmetic overflow (e.g. during maturity timestamp calculations) and ensure input sanity, the following upper-bound limits are enforced in `create_commitment`:
+- **Maximum Amount (`MAX_AMOUNT`)**: `1_000_000_000_000` (1T units)
+- **Maximum Duration (`MAX_DURATION_DAYS`)**: `365` days (1 year)
+- **Maximum Penalty (`MAX_PENALTY_BPS`)**: `10_000` bps (100%)
 
-- `penalty = floor(amount * penalty_bps / 10_000)`
-- `refund = amount - penalty`
+Attempts to exceed these limits will return `InvalidAmount` or `InvalidDuration` errors, respectively.
 
-This keeps the split stable and preserves the invariant `refund + penalty == amount`
-for valid principal amounts. The contract enforces `0 <= penalty_bps <= 10_000`
-and uses checked arithmetic so overflowing intermediate multiplication is rejected
-instead of wrapping. Boundary cases are documented in the contract tests:
-
-- `penalty_bps = 0` → full principal refund, zero penalty
-- `penalty_bps = 10_000` → zero refund, full principal penalty
-- tiny amounts (`1`, `2`, `3`, etc.) remain non-negative and partition cleanly
-- seeded deterministic property tests cover randomized mid-range values and overflow guards
 
 ### Errors
 

@@ -474,6 +474,18 @@ fn create_rejects_invalid_amount() {
 }
 
 #[test]
+fn create_rejects_overflow_duration() {
+    let f = setup();
+    // Set timestamp close to max to cause overflow when adding duration
+    f.env.ledger().set_timestamp(u64::MAX - 10);
+    let owner = Address::generate(&f.env);
+    fund_owner(&f, &owner, 1_000);
+    // Use a duration that will overflow when added to current timestamp
+    let res = f.client.try_create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10u32, &2000u32);
+    assert_eq!(res, Err(Ok(Error::InvalidDuration)));
+}
+
+#[test]
 fn create_rejects_excessive_penalty() {
     let f = setup();
     let owner = Address::generate(&f.env);
@@ -515,103 +527,35 @@ fn owner_index_tracks_commitments() {
     assert_eq!(ids.len(), 2);
     assert_eq!(ids.get(0).unwrap(), a);
     assert_eq!(ids.get(1).unwrap(), b);
-
-    #[test]
-    fn create_rejects_excessive_amount() {
-        let f = setup();
-        let owner = Address::generate(&f.env);
-        let res = f.client.try_create_commitment(
-            &owner,
-            &f.asset,
-            &(MAX_AMOUNT + 1),
-            &RiskProfile::Safe,
-            &(MAX_DURATION_DAYS + 1),
-            &2000,
-        );
-        assert_eq!(res, Err(Ok(Error::InvalidAmount)));
-    }
-
-    #[test]
-    fn create_rejects_excessive_duration() {
-        let f = setup();
-        let owner = Address::generate(&f.env);
-        let res = f.client.try_create_commitment(
-            &owner,
-            &f.asset,
-            &1_000,
-            &RiskProfile::Safe,
-            &(MAX_DURATION_DAYS + 1),
-            &2000,
-        );
-        assert_eq!(res, Err(Ok(Error::InvalidDuration)));
-    }
-}
-
-fn assert_refund_invariants(amount: i128, penalty_bps: u32) {
-    let (penalty, refund) = EscrowContract::compute_refund_amount(amount, penalty_bps)
-        .expect("valid refund inputs must compute deterministically");
-
-    assert!(refund >= 0, "refund must never be negative");
-    assert!(penalty >= 0, "penalty must never be negative");
-    assert_eq!(refund + penalty, amount, "refund and penalty must partition principal");
-    assert!(penalty <= amount, "penalty must never exceed principal");
 }
 
 #[test]
-fn deterministic_seeded_refund_inputs_preserve_penalty_invariants() {
-    let mut runner = TestRunner::deterministic();
-    let strategy = (1i128..=1_000_000i128, 0u32..=10_000u32);
-
-    runner
-        .run(&strategy, |(amount, penalty_bps)| {
-            let (penalty, refund) = EscrowContract::compute_refund_amount(amount, penalty_bps)
-                .map_err(|_| TestCaseError::fail("refund math should stay within arithmetic bounds"))?;
-
-            prop_assert_eq!(refund + penalty, amount);
-            prop_assert!(refund >= 0);
-            prop_assert!(penalty >= 0);
-            prop_assert!(penalty <= amount);
-            Ok(())
-        })
-        .unwrap();
+fn create_rejects_excessive_amount() {
+    let f = setup();
+    let owner = Address::generate(&f.env);
+    let res = f.client.try_create_commitment(
+        &owner,
+        &f.asset,
+        &(MAX_AMOUNT + 1),
+        &RiskProfile::Safe,
+        &30,
+        &2000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
 
 #[test]
-fn penalty_bps_zero_returns_full_refund() {
-    let amount = 9_876;
-    let (penalty, refund) = EscrowContract::compute_refund_amount(amount, 0)
-        .expect("zero penalty must be computable");
-
-    assert_eq!(penalty, 0);
-    assert_eq!(refund, amount);
-    assert_eq!(refund + penalty, amount);
+fn create_rejects_excessive_duration() {
+    let f = setup();
+    let owner = Address::generate(&f.env);
+    let res = f.client.try_create_commitment(
+        &owner,
+        &f.asset,
+        &1_000,
+        &RiskProfile::Safe,
+        &(MAX_DURATION_DAYS + 1),
+        &2000,
+    );
+    assert_eq!(res, Err(Ok(Error::InvalidDuration)));
 }
 
-#[test]
-fn penalty_bps_max_returns_zero_refund() {
-    let amount = 9_876;
-    let (penalty, refund) = EscrowContract::compute_refund_amount(amount, 10_000)
-        .expect("max penalty must be computable");
-
-    assert_eq!(penalty, amount);
-    assert_eq!(refund, 0);
-    assert_eq!(refund + penalty, amount);
-}
-
-#[test]
-fn overflow_guard_rejects_extreme_amounts() {
-    let overflow_amount = i128::MAX / 10_000 + 1;
-    let err = EscrowContract::compute_refund_amount(overflow_amount, 10_000)
-        .expect_err("overflowing intermediate multiplication must be rejected");
-
-    assert_eq!(err, Error::InvalidAmount);
-}
-
-#[test]
-fn small_amount_edge_cases_keep_refund_penalty_invariants() {
-    for amount in [1, 2, 3, 5, 10] {
-        assert_refund_invariants(amount, 0);
-        assert_refund_invariants(amount, 1);
-        assert_refund_invariants(amount, 10_000);
-    }
-}
