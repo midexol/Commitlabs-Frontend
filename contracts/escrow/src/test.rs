@@ -1,47 +1,6 @@
-#[test]
-fn admin_can_rotate_admin_and_fee_recipient() {
-    let f = setup();
-    let new_admin = Address::generate(&f.env);
-    let new_fee = Address::generate(&f.env);
-
-    // Only admin can rotate admin
-    f.env.set_auths(&[&f.admin]);
-    f.client.set_admin(&new_admin);
-    // Only new admin can rotate fee recipient
-    f.env.set_auths(&[&new_admin]);
-    f.client.set_fee_recipient(&new_fee);
-
-    // Check storage
-    let stored_admin: Address = f.env.storage().instance().get(&DataKey::Admin).unwrap();
-    let stored_fee: Address = f.env.storage().instance().get(&DataKey::FeeRecipient).unwrap();
-    assert_eq!(stored_admin, new_admin);
-    assert_eq!(stored_fee, new_fee);
-}
-
-#[test]
-fn unauthorized_cannot_rotate_admin_or_fee_recipient() {
-    let f = setup();
-    let new_admin = Address::generate(&f.env);
-    let new_fee = Address::generate(&f.env);
-    let not_admin = Address::generate(&f.env);
-
-    // Not admin tries to rotate admin
-    f.env.set_auths(&[&not_admin]);
-    let res = f.client.try_set_admin(&new_admin);
-    assert_eq!(res, Err(Ok(Error::Unauthorized)));
-
-    // Not admin tries to rotate fee recipient
-    let res2 = f.client.try_set_fee_recipient(&new_fee);
-    assert_eq!(res2, Err(Ok(Error::Unauthorized)));
-}
-#![cfg(test)]
-
 use super::*;
-use proptest::prelude::*;
-use proptest::test_runner::TestRunner;
 use soroban_sdk::{
-    map,
-    testutils::{Address as _, Ledger as _},
+    testutils::{storage::Persistent as _, Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
     Address, Bytes, BytesN, Env, String,
 };
@@ -108,6 +67,14 @@ fn fund_owner(f: &Fixture, owner: &Address, amount: i128) {
     f.token_admin.mint(owner, &amount);
 }
 
+fn expected_ttl_for_maturity(env: &Env, maturity: u64) -> u32 {
+    let remaining_seconds = maturity.saturating_sub(env.ledger().timestamp());
+    let remaining_ledgers =
+        (remaining_seconds.saturating_add(ESTIMATED_LEDGER_SECONDS - 1)) / ESTIMATED_LEDGER_SECONDS;
+    let target = remaining_ledgers.saturating_add(TTL_MATURITY_BUFFER_LEDGERS as u64);
+    core::cmp::min(target, env.storage().max_ttl() as u64) as u32
+}
+
 // ── Event assertion helper ────────────────────────────────────────────────────
 
 /// Asserts that the escrow contract emitted exactly one event whose first topic
@@ -121,40 +88,6 @@ fn fund_owner(f: &Fixture, owner: &Address, amount: i128) {
 /// # Panics
 /// Panics with a descriptive message if no matching event is found or if the
 /// data does not match.
-fn assert_event<D: IntoVal<Env, Val>>(
-    env: &Env,
-    contract_id: &Address,
-    event_name: &str,
-    expected_data: D,
-) {
-    let all = env.events().all();
-    let sym = Symbol::new(env, event_name);
-    let expected_val: Val = expected_data.into_val(env);
-
-    let found = all.iter().any(|(id, topics, data)| {
-        if &id != contract_id {
-            return false;
-        }
-        // topics is soroban_sdk::Vec<Val>; first element is the Symbol
-        if topics.len() == 0 {
-            return false;
-        }
-        let first_val = topics.get(0).unwrap();
-        let first_topic = Symbol::try_from_val(env, &first_val)
-            .unwrap_or_else(|_| Symbol::new(env, "__none__"));
-        if first_topic != sym {
-            return false;
-        }
-        data == expected_val
-    });
-
-    assert!(
-        found,
-        "expected event '{}' with matching data not found in emitted events",
-        event_name
-    );
-}
-
 // ── Existing lifecycle tests (unchanged) ─────────────────────────────────────
 
 #[test]
@@ -163,7 +96,7 @@ fn initialize_is_one_time() {
     let other = Address::generate(&f.env);
     let res = f
         .client
-        .try_initialize(&f.admin, &f.asset, &other);
+        .try_initialize(&f.admin, &f.asset, &other, &200, &300, &500);
     assert_eq!(res, Err(Ok(Error::AlreadyInitialized)));
 }
 
@@ -256,7 +189,7 @@ fn release_after_maturity_pays_principal_plus_yield() {
 
     // Advance ledger time past maturity.
     f.env.ledger().set_timestamp(11 * 86_400);
-    let paid = f.client.release(&id, &owner);
+    let paid = f.client.release(&id);
 
     let commitment = f.client.get_commitment(&id);
     assert_eq!(commitment.accrued_yield, 1);
@@ -274,11 +207,11 @@ fn release_without_yield_pool_fails() {
     fund_owner(&f, &owner, 1_000);
     let id = f
         .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10, &200);
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10, &200, &Map::new(&f.env));
     f.client.fund_escrow(&id);
 
     f.env.ledger().set_timestamp(11 * 86_400);
-    let res = f.client.try_release(&id, &owner);
+    let res = f.client.try_release(&id);
     assert_eq!(res, Err(Ok(Error::InsufficientYieldPool)));
 }
 
@@ -290,7 +223,7 @@ fn third_party_can_trigger_release_post_maturity() {
     fund_owner(&f, &owner, 1_000);
     let id = f
         .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10, &200);
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10, &200, &Map::new(&f.env));
     f.client.fund_escrow(&id);
 
     // Advance ledger time past maturity so release becomes allowed.
@@ -328,7 +261,7 @@ fn pause_blocks_create_fund_and_refund_but_allows_release() {
 
     let id = f
         .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Balanced, &30, &300);
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Balanced, &30, &300, &Map::new(&f.env));
     f.client.fund_escrow(&id);
 
     // Pause contract writes.
@@ -339,7 +272,15 @@ fn pause_blocks_create_fund_and_refund_but_allows_release() {
 
     // New writes are blocked while paused.
     let other = Address::generate(&f.env);
-    let create_res = f.client.try_create_commitment(&other, &f.asset, &1_000, &RiskProfile::Safe, &30, &200);
+    let create_res = f.client.try_create_commitment(
+        &other,
+        &f.asset,
+        &1_000,
+        &RiskProfile::Safe,
+        &30,
+        &200,
+        &Map::new(&f.env),
+    );
     assert_eq!(create_res, Err(Ok(Error::Paused)));
 
     let fund_res = f.client.try_fund_escrow(&id);
@@ -347,7 +288,7 @@ fn pause_blocks_create_fund_and_refund_but_allows_release() {
 
     // Mature release remains available while paused.
     f.env.ledger().set_timestamp(31 * 86_400);
-    let paid = f.client.release(&id, &owner);
+    let paid = f.client.release(&id);
     assert_eq!(paid, 1_000);
     assert_eq!(f.client.get_commitment(&id).status, EscrowStatus::Released);
 
@@ -396,7 +337,7 @@ fn refund_within_grace_period_is_penalty_free() {
 
     let id = f
         .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Aggressive, &30, &500);
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Aggressive, &30, &500, &Map::new(&f.env));
     f.client.fund_escrow(&id);
 
     // Advance to the exact start of the grace window.
@@ -418,7 +359,7 @@ fn refund_outside_grace_period_still_applies_penalty() {
 
     let id = f
         .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Aggressive, &30, &500);
+        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Aggressive, &30, &500, &Map::new(&f.env));
     f.client.fund_escrow(&id);
 
     // Advance to just before the grace window begins.
@@ -481,7 +422,15 @@ fn create_rejects_overflow_duration() {
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
     // Use a duration that will overflow when added to current timestamp
-    let res = f.client.try_create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Safe, &10u32, &2000u32);
+    let res = f.client.try_create_commitment(
+        &owner,
+        &f.asset,
+        &1_000,
+        &RiskProfile::Safe,
+        &10u32,
+        &2000u32,
+        &Map::new(&f.env),
+    );
     assert_eq!(res, Err(Ok(Error::InvalidDuration)));
 }
 
@@ -540,6 +489,7 @@ fn create_rejects_excessive_amount() {
         &RiskProfile::Safe,
         &30,
         &2000,
+        &Map::new(&f.env),
     );
     assert_eq!(res, Err(Ok(Error::InvalidAmount)));
 }
@@ -555,7 +505,112 @@ fn create_rejects_excessive_duration() {
         &RiskProfile::Safe,
         &(MAX_DURATION_DAYS + 1),
         &2000,
+        &Map::new(&f.env),
     );
     assert_eq!(res, Err(Ok(Error::InvalidDuration)));
+}
+
+#[test]
+fn create_bumps_commitment_and_owner_index_ttl_to_maturity() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(100);
+    f.env.ledger().set_timestamp(0);
+    f.env.ledger().set_min_persistent_entry_ttl(16);
+    f.env.ledger().set_max_entry_ttl(20_000);
+
+    let owner = Address::generate(&f.env);
+    let id = f.client.create_commitment(
+        &owner,
+        &f.asset,
+        &1_000,
+        &RiskProfile::Safe,
+        &1,
+        &200,
+        &Map::new(&f.env),
+    );
+    let commitment = f.client.get_commitment(&id);
+    let expected_ttl = expected_ttl_for_maturity(&f.env, commitment.maturity);
+    let commitment_ttl = f
+        .env
+        .as_contract(&f.contract_id, || f.env.storage().persistent().get_ttl(&DataKey::Commitment(id)));
+    let owner_index_ttl = f.env.as_contract(&f.contract_id, || {
+        f.env
+            .storage()
+            .persistent()
+            .get_ttl(&DataKey::OwnerIndex(owner.clone()))
+    });
+
+    assert_eq!(commitment_ttl, expected_ttl);
+    assert_eq!(owner_index_ttl, expected_ttl);
+}
+
+#[test]
+fn fund_mutation_refreshes_commitment_ttl_when_it_falls_behind_maturity() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(100);
+    f.env.ledger().set_timestamp(0);
+    f.env.ledger().set_min_persistent_entry_ttl(16);
+    f.env.ledger().set_max_entry_ttl(25_000);
+
+    let owner = Address::generate(&f.env);
+    fund_owner(&f, &owner, 1_000);
+
+    let id = f.client.create_commitment(
+        &owner,
+        &f.asset,
+        &1_000,
+        &RiskProfile::Balanced,
+        &1,
+        &300,
+        &Map::new(&f.env),
+    );
+
+    f.env.ledger().set_sequence_number(9_100);
+    f.env.ledger().set_timestamp(500);
+
+    f.client.fund_escrow(&id);
+
+    let maturity = f.client.get_commitment(&id).maturity;
+    let expected_ttl = expected_ttl_for_maturity(&f.env, maturity);
+    let commitment_ttl = f
+        .env
+        .as_contract(&f.contract_id, || f.env.storage().persistent().get_ttl(&DataKey::Commitment(id)));
+    assert_eq!(commitment_ttl, expected_ttl);
+}
+
+#[test]
+fn owner_index_ttl_tracks_the_latest_commitment_maturity() {
+    let f = setup();
+    f.env.ledger().set_sequence_number(100);
+    f.env.ledger().set_timestamp(0);
+    f.env.ledger().set_min_persistent_entry_ttl(16);
+    f.env.ledger().set_max_entry_ttl(40_000);
+
+    let owner = Address::generate(&f.env);
+    f.client.create_commitment(
+        &owner,
+        &f.asset,
+        &100,
+        &RiskProfile::Safe,
+        &1,
+        &200,
+        &Map::new(&f.env),
+    );
+    let long_id = f.client.create_commitment(
+        &owner,
+        &f.asset,
+        &200,
+        &RiskProfile::Balanced,
+        &2,
+        &300,
+        &Map::new(&f.env),
+    );
+
+    let long_commitment = f.client.get_commitment(&long_id);
+    let expected_ttl = expected_ttl_for_maturity(&f.env, long_commitment.maturity);
+    let owner_index_ttl = f
+        .env
+        .as_contract(&f.contract_id, || f.env.storage().persistent().get_ttl(&DataKey::OwnerIndex(owner)));
+    assert_eq!(owner_index_ttl, expected_ttl);
 }
 

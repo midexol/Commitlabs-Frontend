@@ -50,6 +50,19 @@ create_commitment ──► fund_escrow ──► release            (matured: p
                                   └──► dispute ──► resolve_dispute   (admin adjudication)
 ```
 
+### Persistent storage TTL strategy
+
+Commitment records and owner-index entries live in persistent Soroban storage, so
+they need explicit TTL management for long-duration escrows.
+
+- `save` bumps each `Commitment(id)` entry when its remaining TTL no longer covers the commitment maturity horizon.
+- `index_owner` recomputes the latest maturity still referenced by an owner's id list and bumps `OwnerIndex(owner)` to that horizon.
+- The target TTL is the remaining time to maturity plus a small post-maturity ledger buffer so release/refund can still execute after the unlock point.
+- Bumps are thresholded instead of unconditional to avoid paying rent-extension fees when an entry already has enough TTL.
+
+This keeps active commitments readable for their full lifecycle while keeping
+Soroban fee overhead under control.
+
 ### Marketplace transfer flow (secondary trading)
 
 `transfer_ownership(commitment_id, new_owner)` updates ownership for a **funded** commitment.
@@ -70,7 +83,7 @@ create_commitment ──► fund_escrow ──► release            (matured: p
 | --- | --- |
 | `initialize(admin, token, fee_recipient, safe_default_penalty_bps, balanced_default_penalty_bps, aggressive_default_penalty_bps)` | One-time setup of admin, escrow token (SAC), fee recipient, and default penalties for each risk profile. |
 | `create_commitment(owner, asset, amount, risk, duration_days, penalty_bps)` | Create an unfunded commitment with explicit penalty; returns its `id`. |
-| `create_commitment_with_default_penalty(owner, asset, amount, risk, duration_days)` | Create an unfunded commitment using the default penalty for the risk profile; returns its `id`. |
+| `create_default_commitment(owner, asset, amount, risk, duration_days)` | Create an unfunded commitment using the default penalty for the risk profile; returns its `id`. |
 | `fund_escrow(commitment_id)` | Transfer `amount` from owner into the contract (`Created → Funded`). |
 | `transfer_ownership(commitment_id, new_owner)` | Transfer marketplace ownership for secondary trading (`Funded` only). Current owner must authorize and the contract updates both `Commitment.owner` and `OwnerIndex`. |
 | `release(commitment_id, caller)` | Return principal to owner once matured (`Funded → Released`). |
