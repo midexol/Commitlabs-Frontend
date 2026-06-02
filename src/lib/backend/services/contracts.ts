@@ -55,6 +55,7 @@ export interface ChainCommitment {
   violationCount: number;
   createdAt?: string;
   expiresAt?: string;
+  contractVersion?: string;
 }
 
 export interface CreateCommitmentOnChainResult {
@@ -143,6 +144,7 @@ type ContractCallMode = "read" | "write";
 interface ContractInvocationResult {
   value: unknown;
   txHash?: string;
+  version?: string;
 }
 
 /**
@@ -163,6 +165,46 @@ function getRpcUrl(): string {
 
 function getNetworkPassphrase(): string {
   return getBackendConfig().networkPassphrase;
+}
+
+function getRpcTimeoutMs(): number {
+  const raw = Number(process.env.SOROBAN_RPC_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+}
+
+async function withRpcTimeout<T>(
+  promise: Promise<T>,
+  methodName: string,
+): Promise<T> {
+  const timeoutMs = getRpcTimeoutMs();
+  let timer: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => {
+          reject(
+            new BackendError({
+              code: "GATEWAY_TIMEOUT",
+              message:
+                "The blockchain operation timed out. It may still be processed later.",
+              status: 504,
+              details: {
+                methodName,
+                timeoutMs,
+                retryable: true,
+              },
+            }),
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
 }
 
 function getContractId(kind: "commitmentCore" | "attestationEngine"): string {
@@ -188,6 +230,45 @@ function getSourcePublicKey(): string | null {
   }
 
   return process.env.SOROBAN_SOURCE_ACCOUNT || null;
+}
+
+function getRpcTimeoutMs(): number {
+  const raw = Number(process.env.SOROBAN_RPC_TIMEOUT_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 15_000;
+}
+
+async function withRpcTimeout<T>(
+  operation: Promise<T>,
+  methodName: string,
+  timeoutMs = getRpcTimeoutMs(),
+): Promise<T> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+
+  try {
+    return await Promise.race([
+      operation,
+      new Promise<T>((_, reject) => {
+        timeoutHandle = setTimeout(() => {
+          reject(
+            new BackendError({
+              code: "GATEWAY_TIMEOUT",
+              message: "The blockchain operation timed out. It may still be processed later.",
+              status: 504,
+              details: {
+                methodName,
+                timeoutMs,
+                retryable: true,
+              },
+            }),
+          );
+        }, timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle) {
+      clearTimeout(timeoutHandle);
+    }
+  }
 }
 
 function getSorobanServer(): SorobanRpc.Server {
@@ -453,6 +534,10 @@ const READ_RETRY_CONFIG = {
  * failures — 404 (not found) and 400 (validation) — are never retried.
  */
 export function isRetryableContractError(error: unknown): boolean {
+  if (error instanceof BackendError && error.code === "GATEWAY_TIMEOUT") {
+    return false;
+  }
+
   const normalized = normalizeContractError(error, {
     code: "BLOCKCHAIN_CALL_FAILED",
     message: "Soroban read call failed.",
@@ -514,6 +599,7 @@ function parseChainCommitment(value: unknown): ChainCommitment {
     violationCount: asNumber(raw.violationCount ?? raw.violation_count),
     createdAt: asString(raw.createdAt ?? raw.created_at) || undefined,
     expiresAt: asString(raw.expiresAt ?? raw.expires_at) || undefined,
+    contractVersion: (getBackendConfig() as { activeVersion?: string }).activeVersion,
   };
 }
 
@@ -586,6 +672,46 @@ function parseCommitmentList(value: unknown): ChainCommitment[] {
   return value.map((item) => parseChainCommitment(item));
 }
 
+function getRpcTimeoutMs(): number {
+  const raw = process.env.SOROBAN_RPC_TIMEOUT_MS;
+  const parsed = raw ? Number(raw) : NaN;
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 15_000;
+}
+
+function withRpcTimeout<T>(
+  promise: Promise<T>,
+  methodName: string,
+  timeoutMs = getRpcTimeoutMs(),
+): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(
+        new BackendError({
+          code: "GATEWAY_TIMEOUT",
+          message: "The blockchain operation timed out. It may still be processed later.",
+          status: 504,
+          details: {
+            methodName,
+            timeoutMs,
+            retryable: true,
+          },
+        }),
+      );
+    }, timeoutMs);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      },
+    );
+  });
+}
+
 async function waitForTransactionResult(
   server: SorobanRpc.Server,
   hash: string,
@@ -593,7 +719,11 @@ async function waitForTransactionResult(
 ): Promise<unknown> {
   const startedAt = Date.now();
   while (Date.now() - startedAt < timeoutMs) {
-    const tx = await server.getTransaction(hash);
+    const tx = await withRpcTimeout(
+      server.getTransaction(hash),
+      "getTransaction",
+      timeoutMs,
+    );
     if (tx.status === SorobanRpc.Api.GetTransactionStatus.SUCCESS) {
       return tx.returnValue ? scValToNative(tx.returnValue) : null;
     }
@@ -655,7 +785,10 @@ async function invokeContractMethod(
   const contract = new Contract(contractId);
   const account =
     mode === "write"
-      ? await server.getAccount(sourcePublicKey)
+      ? await withRpcTimeout(
+          server.getAccount(sourcePublicKey),
+          `${methodName}.getAccount`,
+        )
       : new Account(sourcePublicKey, "0");
   const operation = contract.call(
     methodName,
@@ -670,7 +803,10 @@ async function invokeContractMethod(
     .setTimeout(30)
     .build();
 
-  const simulation = await server.simulateTransaction(tx);
+  const simulation = await withRpcTimeout(
+    server.simulateTransaction(tx),
+    `${methodName}.simulateTransaction`,
+  );
   if (SorobanRpc.Api.isSimulationError(simulation)) {
     throw normalizeContractError(new Error(simulation.error), {
       code: "BLOCKCHAIN_CALL_FAILED",
@@ -683,6 +819,7 @@ async function invokeContractMethod(
   if (mode === "read") {
     return {
       value: simulation.result ? scValToNative(simulation.result.retval) : null,
+      version: getBackendConfig().activeVersion,
     };
   }
 
@@ -696,13 +833,19 @@ async function invokeContractMethod(
     });
   }
 
-  const preparedTx = await server.prepareTransaction(tx);
+  const preparedTx = await withRpcTimeout(
+    server.prepareTransaction(tx),
+    `${methodName}.prepareTransaction`,
+  );
   preparedTx.sign(sourceKeypair);
-  const sendResult = await server.sendTransaction(preparedTx);
+  const sendResult = await withRpcTimeout(
+    server.sendTransaction(preparedTx),
+    "sendTransaction",
+  );
   const txHash = sendResult.hash;
 
   const onChainValue = await waitForTransactionResult(server, txHash);
-  return { value: onChainValue, txHash };
+  return { value: onChainValue, txHash, version: getBackendConfig().activeVersion };
 }
 
 /**
@@ -729,7 +872,12 @@ async function invokeReadContractMethod(
       invokeContractMethod(contractId, methodName, params, "read", attempt),
     {
       ...READ_RETRY_CONFIG,
-      isRetryable: isRetryableContractError,
+      isRetryable: (error) =>
+        !(
+          error instanceof BackendError &&
+          error.code === "GATEWAY_TIMEOUT" &&
+          asRecord(error.details).timeoutMs !== undefined
+        ) && isRetryableContractError(error),
       onRetry: ({ attempt, delayMs, error }) => {
         logInfo(undefined, "[soroban] retrying read after transient failure", {
           methodName,
@@ -826,7 +974,10 @@ export async function getCommitmentFromChain(
     const countersAdapter = getCountersAdapter();
     void countersAdapter.incrementSuccessfulActions(); // Fire and forget for metrics
 
-    const commitment = parseChainCommitment(invocation.value);
+    const commitment = {
+      ...parseChainCommitment(invocation.value),
+      contractVersion: invocation.version ?? getBackendConfig().activeVersion,
+    };
     await cache.set(cacheKey, commitment, CacheTTL.COMMITMENT_DETAIL);
     return commitment;
   } catch (error) {
@@ -1280,38 +1431,35 @@ export async function openDisputeOnChain(
 
     const invocation = await invokeContractMethod(
       getContractId("commitmentCore"),
-      "dispute",
-      [params.commitmentId, params.callerAddress, params.reason, params.evidence ?? ""],
+      "early_exit_commitment",
+      [params.commitmentId, params.callerAddress ?? commitment.ownerAddress],
       "write",
     );
 
     const result = asRecord(invocation.value);
-    const disputeId = asString(result.disputeId ?? result.id);
-    const status = asString(result.status, "DISPUTED");
+    const exitAmount = asString(result.exitAmount, "0");
+    const penaltyAmount = asString(result.penaltyAmount, "0");
+    const finalStatus = asString(result.finalStatus, "EARLY_EXIT");
 
-    // Status changed — invalidate detail and owner list.
     await cache.delete(CacheKey.commitment(params.commitmentId));
     if (commitment.ownerAddress) {
       await cache.delete(CacheKey.userCommitments(commitment.ownerAddress));
     }
-    logInfo(undefined, "[cache] invalidated commitment after dispute", {
-      commitmentId: params.commitmentId,
-    });
 
     return {
-      commitmentId: params.commitmentId,
-      disputeId: disputeId || `dsp-${params.commitmentId}`,
-      status,
+      exitAmount,
+      penaltyAmount,
+      finalStatus,
       txHash: invocation.txHash,
-      disputedAt: new Date().toISOString(),
+      reference: invocation.txHash ? undefined : "TODO_CHAIN_CALL_EARLY_EXIT",
     };
   } catch (error) {
     throw normalizeContractError(error, {
       code: "BLOCKCHAIN_CALL_FAILED",
-      message: "Unable to open dispute on chain.",
+      message: "Unable to exit commitment early on chain.",
       status: 502,
       details: {
-        method: "dispute",
+        method: "early_exit_commitment",
         commitmentId: params.commitmentId,
       },
     });
@@ -1369,13 +1517,14 @@ export async function resolveDisputeOnChain(
       resolvedAt: new Date().toISOString(),
     };
   } catch (error) {
-    throw normalizeContractError(error, {
+    throw normalizeBackendError(error, {
       code: "BLOCKCHAIN_CALL_FAILED",
       message: "Unable to resolve dispute on chain.",
       status: 502,
       details: {
         method: "resolve_dispute",
         commitmentId: params.commitmentId,
+        requestId: loggingContext?.requestId,
       },
     });
   }
