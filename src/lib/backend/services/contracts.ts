@@ -1166,20 +1166,27 @@ export async function settleCommitmentOnChain(
     }
 
     if (commitment.status === "ACTIVE") {
-      // Check if commitment has expired (if expiresAt is available)
+      // Invariant: An active commitment can only be settled if it has matured.
+      // If expiresAt is present, we check if the current time is past the expiry time.
+      // If expiresAt is missing, we err on the side of safety and block settlement
+      // to prevent un-matured commitments from being settled prematurely.
       if (commitment.expiresAt) {
         const expiryTime = new Date(commitment.expiresAt).getTime();
         const now = new Date().getTime();
         if (now < expiryTime) {
           throw new BackendError({
-            code: "BAD_REQUEST",
+            code: "NOT_MATURED",
             message: "Commitment has not matured yet and cannot be settled.",
             status: 400,
           });
         }
+      } else {
+        throw new BackendError({
+          code: "NOT_MATURED",
+          message: "Commitment maturity information is missing. Cannot settle.",
+          status: 400,
+        });
       }
-      // TODO: Add additional maturity checks if needed
-      // For now, we'll allow settling active commitments
     }
 
     // Call the settlement function on the contract
@@ -1319,6 +1326,79 @@ export async function fundEscrowOnChain(
   }
 }
 
+export async function earlyExitCommitmentOnChain(
+  params: EarlyExitCommitmentOnChainParams,
+  loggingContext?: LoggingContext,
+): Promise<EarlyExitCommitmentOnChainResult> {
+  try {
+    if (!params.commitmentId) {
+      throw new BackendError({
+        code: "BAD_REQUEST",
+        message: "Missing commitment id for early exit.",
+        status: 400,
+      });
+    }
+
+    const commitment = await getCommitmentFromChain(params.commitmentId, loggingContext);
+
+    if (commitment.status === "SETTLED") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message:
+          "Commitment has already been settled and cannot be exited early.",
+        status: 409,
+      });
+    }
+
+    if (commitment.status === "EARLY_EXIT") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message: "Commitment has already been exited early.",
+        status: 409,
+      });
+    }
+
+    if (commitment.status === "VIOLATED") {
+      throw new BackendError({
+        code: "CONFLICT",
+        message: "Commitment has been violated and cannot be exited early.",
+        status: 409,
+      });
+    }
+
+    const invocation = await invokeContractMethod(
+      getContractId("commitmentCore"),
+      "early_exit_commitment",
+      [params.commitmentId, params.callerAddress ?? commitment.ownerAddress],
+      "write",
+    );
+
+    const result = asRecord(invocation.value);
+    const exitAmount = asString(result.exitAmount, "0");
+    const penaltyAmount = asString(result.penaltyAmount, "0");
+    const finalStatus = asString(result.finalStatus, "EARLY_EXIT");
+
+    return {
+      exitAmount,
+      penaltyAmount,
+      finalStatus,
+      txHash: invocation.txHash,
+      contractVersion: invocation.version,
+      reference: invocation.txHash ? undefined : `TODO_CHAIN_CALL_EARLY_EXIT`,
+    };
+  } catch (error) {
+    throw normalizeContractError(error, {
+      code: "BLOCKCHAIN_CALL_FAILED",
+      message: "Unable to exit commitment early on chain.",
+      status: 502,
+      details: {
+        method: "early_exit_commitment",
+        commitmentId: params.commitmentId,
+      },
+    });
+  }
+}
+
 export async function openDisputeOnChain(
   params: DisputeOnChainParams,
 ): Promise<DisputeOnChainResult> {
@@ -1345,97 +1425,6 @@ export async function openDisputeOnChain(
       throw new BackendError({
         code: "CONFLICT",
         message: "Commitment is already in dispute.",
-        status: 409,
-      });
-    }
-
-    const invocation = await invokeContractMethod(
-      getContractId("commitmentCore"),
-      "dispute",
-      [params.commitmentId, params.callerAddress, params.reason, params.evidence ?? ""],
-      "write",
-    );
-
-    const result = asRecord(invocation.value);
-    const disputeId = asString(result.disputeId ?? result.id) || `dsp-${params.commitmentId}`;
-    const status = asString(result.status, "DISPUTED");
-
-    await cache.delete(CacheKey.commitment(params.commitmentId));
-    if (commitment.ownerAddress) {
-      await cache.delete(CacheKey.userCommitments(commitment.ownerAddress));
-    }
-
-    logInfo(undefined, "[cache] invalidated commitment after dispute", {
-      commitmentId: params.commitmentId,
-    });
-
-    return {
-      commitmentId: params.commitmentId,
-      disputeId,
-      status,
-      txHash: invocation.txHash,
-      disputedAt: new Date().toISOString(),
-    };
-  } catch (error) {
-    throw normalizeContractError(error, {
-      code: "BLOCKCHAIN_CALL_FAILED",
-      message: "Unable to open dispute on chain.",
-      status: 502,
-      details: {
-        method: "dispute",
-        commitmentId: params.commitmentId,
-      },
-    });
-  }
-}
-
-export async function earlyExitCommitmentOnChain(
-  params: EarlyExitCommitmentOnChainParams,
-  loggingContext?: LoggingContext,
-): Promise<EarlyExitCommitmentOnChainResult> {
-  try {
-    if (!params.commitmentId) {
-      throw new BackendError({
-        code: "BAD_REQUEST",
-        message: "Missing commitment id for early exit.",
-        status: 400,
-      });
-    }
-
-    const commitment = await getCommitmentFromChain(
-      params.commitmentId,
-      loggingContext,
-    );
-
-    if (commitment.status === "SETTLED") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message:
-          "Commitment has already been settled and cannot be exited early.",
-        status: 409,
-      });
-    }
-
-    if (commitment.status === "DISPUTED") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message: "Commitment is already in dispute.",
-        status: 409,
-      });
-    }
-
-    if (commitment.status === "VIOLATED") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message: "Commitment has been violated and cannot be exited early.",
-        status: 409,
-      });
-    }
-
-    if (commitment.status === "EARLY_EXIT") {
-      throw new BackendError({
-        code: "CONFLICT",
-        message: "Commitment has already been exited early.",
         status: 409,
       });
     }
@@ -1502,12 +1491,7 @@ export async function resolveDisputeOnChain(
     const invocation = await invokeContractMethod(
       getContractId("commitmentCore"),
       "resolve_dispute",
-      [
-        params.commitmentId,
-        params.resolution,
-        params.notes ?? "",
-        params.resolverAddress,
-      ],
+      [params.commitmentId, params.resolution, params.notes ?? ""],
       "write",
     );
 
