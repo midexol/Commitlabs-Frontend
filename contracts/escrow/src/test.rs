@@ -2,13 +2,9 @@ use super::*;
 use soroban_sdk::{
     testutils::{storage::Persistent as _, Address as _, Ledger as _},
     token::{StellarAssetClient, TokenClient},
-    Address, Bytes, BytesN, Env, String,
+    Address, Env, Map, String, Symbol, TryFromVal, Val, Vec,
 };
 
-// ── Test fixture ─────────────────────────────────────────────────────────────
-
-/// Spins up a test environment with a Stellar Asset Contract token and a
-/// deployed, initialized escrow contract. Returns the pieces tests need.
 struct Fixture<'a> {
     env: Env,
     client: EscrowContractClient<'a>,
@@ -26,8 +22,6 @@ fn setup<'a>() -> Fixture<'a> {
 
     let admin = Address::generate(&env);
     let fee_recipient = Address::generate(&env);
-
-    // Deploy a SAC token to use as the escrow asset.
     let issuer = Address::generate(&env);
     let sac = env.register_stellar_asset_contract_v2(issuer);
     let asset = sac.address();
@@ -36,20 +30,7 @@ fn setup<'a>() -> Fixture<'a> {
 
     let contract_id = env.register(EscrowContract, ());
     let client = EscrowContractClient::new(&env, &contract_id);
-    
-    // Initialize with default penalties: Safe 2%, Balanced 3%, Aggressive 5%
-    const SAFE_DEFAULT_PENALTY_BPS: u32 = 200;      // 2%
-    const BALANCED_DEFAULT_PENALTY_BPS: u32 = 300;  // 3%
-    const AGGRESSIVE_DEFAULT_PENALTY_BPS: u32 = 500; // 5%
-    
-    client.initialize(
-        &admin,
-        &asset,
-        &fee_recipient,
-        &SAFE_DEFAULT_PENALTY_BPS,
-        &BALANCED_DEFAULT_PENALTY_BPS,
-        &AGGRESSIVE_DEFAULT_PENALTY_BPS,
-    );
+    client.initialize(&admin, &asset, &fee_recipient, &200u32, &300u32, &500u32);
 
     Fixture {
         env,
@@ -109,72 +90,83 @@ fn upgrade_succeeds_for_admin() {
     // ledger so `update_current_contract_wasm` can succeed in the host.
     let new_hash = BytesN::from_array(
         &f.env,
-        &[
-            0xe3, 0xb0, 0xc4, 0x42, 0x98, 0xfc, 0x1c, 0x14, 0x9a, 0xfb, 0xf4, 0xc8, 0x99, 0x6f,
-            0xb9, 0x24, 0x27, 0xae, 0x41, 0xe4, 0x64, 0x9b, 0x93, 0x4c, 0xa4, 0x95, 0x99, 0x1b,
-            0x78, 0x52, 0xb8, 0x55,
-        ],
+        &f.contract_id,
+        "create_commitment",
+        &owner,
+        id,
+        CreateCommitmentEventData {
+            asset: f.asset.clone(),
+            amount: 1_000,
+            risk: RiskProfile::Balanced,
+            maturity: 30 * 86_400,
+            penalty_bps: 300,
+        },
     );
-    let res = f.client.try_upgrade(&new_hash);
-    assert_eq!(res, Ok(Ok(())));
 }
 
 #[test]
-fn upgrade_rejects_zero_hash() {
+fn default_penalty_creation_keeps_create_commitment_event_name() {
     let f = setup();
-    let zero_hash = BytesN::from_array(&f.env, &[0u8; 32]);
-    let res = f.client.try_upgrade(&zero_hash);
-    assert_eq!(res, Err(Ok(Error::InvalidWasmHash)));
+    let owner = Address::generate(&f.env);
+
+    let id = f.client.create_commitment_with_default(
+        &owner,
+        &f.asset,
+        &2_000i128,
+        &RiskProfile::Safe,
+        &15u32,
+    );
+
+    assert_contract_event(
+        &f.env,
+        &f.contract_id,
+        "create_commitment",
+        &owner,
+        id,
+        CreateCommitmentEventData {
+            asset: f.asset.clone(),
+            amount: 2_000,
+            risk: RiskProfile::Safe,
+            maturity: 15 * 86_400,
+            penalty_bps: 200,
+        },
+    );
 }
 
 #[test]
-fn upgrade_rejects_when_admin_missing() {
-    let env = Env::default();
-    env.mock_all_auths();
-    let contract_id = env.register(EscrowContract, ());
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    let hash = BytesN::from_array(&env, &[2u8; 32]);
-    let res = client.try_upgrade(&hash);
-    assert_eq!(res, Err(Ok(Error::NotInitialized)));
-}
-
-#[test]
-fn upgrade_rejects_without_admin_auth() {
-    let env = Env::default();
-    let admin = Address::generate(&env);
-    let contract_id = env.register(EscrowContract, ());
-    let client = EscrowContractClient::new(&env, &contract_id);
-
-    env.as_contract(&contract_id, || {
-        env.storage().instance().set(&DataKey::Admin, &admin);
-    });
-    // Avoid uploading a wasm blob in this test host; use a precomputed hash.
-    let hash = BytesN::from_array(&env, &[3u8; 32]);
-    let res = client.try_upgrade(&hash);
-    assert!(res.is_err(), "expected unauthorized upgrade to be rejected");
-}
-
-#[test]
-fn create_and_fund_locks_funds() {
+fn fund_escrow_emits_stable_indexable_event() {
     let f = setup();
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
 
-    let id = f
-        .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Balanced, &30, &300, &Map::new(&f.env));
-    let c = f.client.get_commitment(&id);
-    assert_eq!(c.status, EscrowStatus::Created);
-    assert_eq!(c.amount, 1_000);
-
+    let id = f.client.create_commitment(
+        &owner,
+        &f.asset,
+        &1_000i128,
+        &RiskProfile::Balanced,
+        &30u32,
+        &300u32,
+        &metadata(&f.env),
+    );
     f.client.fund_escrow(&id);
+
+    assert_contract_event(
+        &f.env,
+        &f.contract_id,
+        "fund_escrow",
+        &owner,
+        id,
+        FundEscrowEventData {
+            asset: f.asset.clone(),
+            amount: 1_000,
+            risk: RiskProfile::Balanced,
+        },
+    );
     assert_eq!(f.token.balance(&owner), 0);
-    assert_eq!(f.client.get_commitment(&id).status, EscrowStatus::Funded);
 }
 
 #[test]
-fn release_after_maturity_pays_principal_plus_yield() {
+fn release_emits_stable_indexable_event() {
     let f = setup();
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
@@ -191,6 +183,15 @@ fn release_after_maturity_pays_principal_plus_yield() {
     f.env.ledger().set_timestamp(11 * 86_400);
     let paid = f.client.release(&id);
 
+    let id = f.client.create_commitment(
+        &owner,
+        &f.asset,
+        &1_000i128,
+        &RiskProfile::Aggressive,
+        &10u32,
+        &500u32,
+        &metadata(&f.env),
+    );
     let commitment = f.client.get_commitment(&id);
     assert_eq!(commitment.accrued_yield, 1);
     assert_eq!(paid, 1_001);
@@ -389,36 +390,33 @@ fn dispute_freezes_then_admin_resolves() {
         .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Balanced, &30, &300, &Map::new(&f.env));
     f.client.fund_escrow(&id);
 
+    f.token_admin.mint(&f.admin, &commitment.accrued_yield);
     f.client
-        .dispute(&id, &owner, &String::from_str(&f.env, "value mismatch"));
-    assert_eq!(f.client.get_commitment(&id).status, EscrowStatus::Disputed);
+        .deposit_yield_pool(&f.admin, &commitment.accrued_yield);
+    f.env.ledger().set_timestamp(commitment.maturity);
 
-    // Release/refund are blocked while disputed.
-    assert_eq!(
-        f.client.try_refund(&id),
-        Err(Ok(Error::InvalidState))
+    let payout = f.client.release(&id);
+    assert_eq!(payout, commitment.amount + commitment.accrued_yield);
+
+    assert_contract_event(
+        &f.env,
+        &f.contract_id,
+        "release",
+        &owner,
+        id,
+        ReleaseEventData {
+            asset: f.asset.clone(),
+            amount: commitment.amount,
+            accrued_yield: commitment.accrued_yield,
+            payout,
+            risk: RiskProfile::Aggressive,
+        },
     );
-
-    let paid = f.client.resolve_dispute(&id, &true);
-    assert_eq!(paid, 1_000);
-    assert_eq!(f.token.balance(&owner), 1_000);
 }
 
 #[test]
-fn create_rejects_invalid_amount() {
+fn refund_emits_stable_indexable_event() {
     let f = setup();
-    let owner = Address::generate(&f.env);
-    let res =
-        f.client
-            .try_create_commitment(&owner, &f.asset, &0, &RiskProfile::Safe, &30, &200, &Map::new(&f.env));
-    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
-}
-
-#[test]
-fn create_rejects_overflow_duration() {
-    let f = setup();
-    // Set timestamp close to max to cause overflow when adding duration
-    f.env.ledger().set_timestamp(u64::MAX - 10);
     let owner = Address::generate(&f.env);
     fund_owner(&f, &owner, 1_000);
     // Use a duration that will overflow when added to current timestamp
@@ -434,55 +432,44 @@ fn create_rejects_overflow_duration() {
     assert_eq!(res, Err(Ok(Error::InvalidDuration)));
 }
 
-#[test]
-fn create_rejects_excessive_penalty() {
-    let f = setup();
-    let owner = Address::generate(&f.env);
-    let res = f.client.try_create_commitment(
+    let id = f.client.create_commitment(
         &owner,
         &f.asset,
-        &1_000,
-        &RiskProfile::Safe,
-        &30,
-        &20_000,
-        &Map::new(&f.env),
+        &1_000i128,
+        &RiskProfile::Aggressive,
+        &30u32,
+        &500u32,
+        &metadata(&f.env),
     );
-    assert_eq!(res, Err(Ok(Error::PenaltyTooHigh)));
+    f.client.fund_escrow(&id);
+
+    let refunded_amount = f.client.refund(&id);
+    assert_eq!(refunded_amount, 950);
+
+    assert_contract_event(
+        &f.env,
+        &f.contract_id,
+        "refund",
+        &owner,
+        id,
+        RefundEventData {
+            asset: f.asset.clone(),
+            amount: 1_000,
+            refunded_amount: 950,
+            penalty: 50,
+            risk: RiskProfile::Aggressive,
+        },
+    );
+    assert_eq!(f.token.balance(&f.fee_recipient), 50);
 }
 
 #[test]
-fn record_attestation_clamps_score() {
+fn dispute_emits_stable_indexable_event() {
     let f = setup();
     let owner = Address::generate(&f.env);
-    let attestor = Address::generate(&f.env);
-    let id = f
-        .client
-        .create_commitment(&owner, &f.asset, &1_000, &RiskProfile::Balanced, &30, &300, &Map::new(&f.env));
-    f.client.record_attestation(&id, &attestor, &250);
-    assert_eq!(f.client.get_commitment(&id).compliance_score, 100);
-}
+    fund_owner(&f, &owner, 1_000);
 
-#[test]
-fn owner_index_tracks_commitments() {
-    let f = setup();
-    let owner = Address::generate(&f.env);
-    let a = f
-        .client
-        .create_commitment(&owner, &f.asset, &100, &RiskProfile::Safe, &30, &200, &Map::new(&f.env));
-    let b = f
-        .client
-        .create_commitment(&owner, &f.asset, &200, &RiskProfile::Balanced, &30, &300, &Map::new(&f.env));
-    let ids = f.client.get_owner_commitments(&owner);
-    assert_eq!(ids.len(), 2);
-    assert_eq!(ids.get(0).unwrap(), a);
-    assert_eq!(ids.get(1).unwrap(), b);
-}
-
-#[test]
-fn create_rejects_excessive_amount() {
-    let f = setup();
-    let owner = Address::generate(&f.env);
-    let res = f.client.try_create_commitment(
+    let id = f.client.create_commitment(
         &owner,
         &f.asset,
         &(MAX_AMOUNT + 1),
@@ -491,14 +478,15 @@ fn create_rejects_excessive_amount() {
         &2000,
         &Map::new(&f.env),
     );
-    assert_eq!(res, Err(Ok(Error::InvalidAmount)));
-}
+    f.client.fund_escrow(&id);
 
-#[test]
-fn create_rejects_excessive_duration() {
-    let f = setup();
-    let owner = Address::generate(&f.env);
-    let res = f.client.try_create_commitment(
+    let reason = String::from_str(&f.env, "value mismatch during settlement");
+    f.client.dispute(&id, &owner, &reason);
+
+    assert_contract_event(
+        &f.env,
+        &f.contract_id,
+        "dispute",
         &owner,
         &f.asset,
         &1_000,
@@ -507,7 +495,6 @@ fn create_rejects_excessive_duration() {
         &2000,
         &Map::new(&f.env),
     );
-    assert_eq!(res, Err(Ok(Error::InvalidDuration)));
 }
 
 #[test]

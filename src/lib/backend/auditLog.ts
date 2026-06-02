@@ -65,6 +65,12 @@ export type RedactedAuditEvent = Omit<AuditEvent, 'actor' | 'ip'> & {
   actor: string;
   ip: string;
 };
+export interface AuditEventFilters {
+  actor?: string;
+  type?: string;
+  startTime?: string;
+  endTime?: string;
+}
 
 const REDACTED = '[REDACTED]';
 const SENSITIVE_METADATA_KEYS = new Set([
@@ -172,5 +178,17 @@ export async function getRecentAuditEvents(
 
 export async function getAuditEventCount(): Promise<number> {
   if (!isAuditLogEnabled()) return 0;
+
+  const hasFilters =
+    filters !== undefined &&
+    (filters.actor !== undefined ||
+      filters.type !== undefined ||
+      filters.startTime !== undefined ||
+      filters.endTime !== undefined);
+
+  if (hasFilters) {
+    return filterAuditEvents(getAllStoredAuditEvents(), filters).length;
+  }
+
   return activeStore.size();
 }
